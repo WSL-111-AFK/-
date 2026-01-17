@@ -1,0 +1,936 @@
+# -*- coding: utf-8 -*-
+"""
+聊天机器人Web后端（基于Flask+Jieba+TensorFlow Seq2Seq）
+功能：提供前端聊天页面和消息交互接口，支持中文对话回复
+兼容低版本TensorFlow，修复路径错误、变量未定义、跨系统适配问题
+"""
+import os
+import socket
+import platform
+import http.client
+import json
+import re
+from jieba import lcut, add_word
+import tensorflow as tf
+from flask import Flask, render_template, request, jsonify
+
+# ===================== 修复socket主机名编码问题 =====================
+def patched_getfqdn(name=''):
+    try:
+        return socket.gethostbyaddr(name)[0].decode('gbk')
+    except:
+        try:
+            return socket.gethostbyaddr(name)[0].decode('utf-8')
+        except:
+            return str(name)
+socket.getfqdn = patched_getfqdn
+
+# ===================== 全局参数配置（优先定义，避免NameError） =====================
+# 1. 系统类型判断（核心：先定义系统类型，再定义路径）
+SYSTEM_TYPE = platform.system()
+
+# 2. 跨系统路径配置（适配Linux/Windows）
+if SYSTEM_TYPE == "Linux":
+    # Autodl环境路径（请确认你的项目实际路径，若不一致请修改）
+    NLP_ROOT_PATH = "/root/autodl-tmp/AI_QuestionAnswering"
+    NLP_DEEPLEARN_PATH = os.path.join(NLP_ROOT_PATH, "code")
+else:
+    # Windows本地路径
+    NLP_ROOT_PATH = r"C:\Users\18533\Desktop\nlp"
+    NLP_DEEPLEARN_PATH = os.path.join(NLP_ROOT_PATH, "nlp_deeplearn")
+
+# 3. 调试打印（移到变量定义后，解决NameError）
+print(f"=== 调试：顶层NLP目录 → {NLP_ROOT_PATH} ===")
+print(f"=== 调试：nlp_deeplearn路径 → {NLP_DEEPLEARN_PATH} ===")
+
+# 4. 核心路径定义（避免重复赋值）
+DATA_PATH = os.path.join(NLP_DEEPLEARN_PATH, "data")
+CHECKPOINT_PATH = os.path.join(NLP_DEEPLEARN_PATH, "tmp", "model")
+TRANSLATION_CKPT_PATH = os.path.join(NLP_DEEPLEARN_PATH, "tmp", "translation_model")  # 新增翻译模型路径
+
+# 5. 词表/模型路径（统一定义，避免重复）
+TEXT_CLASSIFY_VOCAB_PATH = os.path.join(DATA_PATH, "cnews.vocab.txt")
+TEXT_CLASSIFY_MODEL_PATH = os.path.join(DATA_PATH, "my_text_classify.h5")
+SENTIMENT_VOCAB_PATH = os.path.join(DATA_PATH, "sentiment.vocab.txt")
+SENTIMENT_MODEL_PATH = os.path.join(DATA_PATH, "my_sentiment_model.h5")
+EN_VOCAB_PATH = os.path.join(DATA_PATH, "en_vocab.txt")
+ZH_VOCAB_PATH = os.path.join(DATA_PATH, "zh_vocab.txt")
+
+# 6. 模型超参数（补充缺失的全局变量）
+EMBEDDING_DIM = 128
+HIDDEN_DIM = 256
+MAX_LENGTH = 50
+TEXT_CLASSIFY_MAX_LEN = 50  # 文本分类最大长度（补充缺失）
+SENTIMENT_MAX_LEN = 50      # 情感分析最大长度（补充缺失）
+TRANSLATION_MAX_LEN = 30    # 翻译最大长度（补充缺失）
+SPECIAL_TOKENS = ['_BOS', '_EOS', '_PAD', '_UNK']  # 特殊标记（统一定义）
+CLASSIFY_LABELS = ['体育', '娱乐', '家居', '房产', '教育', '时尚', '时政', '游戏', '科技', '财经']  # 文本分类标签（补充缺失）
+
+# 7. 当前代码路径（辅助变量）
+CURRENT_CODE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+# ===================== 导入Seq2Seq（放在路径定义后，避免依赖问题） =====================
+try:
+    from Seq2Seq import Encoder, Decoder  # 需确保Seq2Seq.py在当前目录
+except ImportError as e:
+    print(f"警告：Seq2Seq模块导入失败 → {e}")
+    # 兜底：定义空的Encoder/Decoder，避免程序崩溃
+    class Encoder(tf.keras.Model):
+        def __init__(self, vocab_size, embedding_dim, hidden_dim):
+            super().__init__()
+            self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+            self.gru = tf.keras.layers.GRU(hidden_dim, return_sequences=True, return_state=True)
+        def call(self, x, hidden=None):
+            x = self.embedding(x)
+            if hidden is None:
+                hidden = self.gru.get_initial_state(x)
+            output, state = self.gru(x, initial_state=hidden)
+            return output, state
+
+    class Decoder(tf.keras.Model):
+        def __init__(self, vocab_size, embedding_dim, hidden_dim):
+            super().__init__()
+            self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+            self.gru = tf.keras.layers.GRU(hidden_dim, return_sequences=True, return_state=True)
+            self.fc = tf.keras.layers.Dense(vocab_size)
+        def call(self, x, hidden, enc_output):
+            x = self.embedding(x)
+            output, state = self.gru(x, initial_state=hidden)
+            output = tf.reshape(output, (-1, output.shape[2]))
+            x = self.fc(output)
+            return x, state, None
+
+# ===================== NLP模型通用工具 =====================
+def load_vocab(vocab_path, require_special_tokens=True):
+    """
+    加载词表，返回word2id映射（带自动补充特殊标记功能）
+    :param vocab_path: 词表路径
+    :param require_special_tokens: 是否需要强制补充特殊标记
+    :return: word2id字典，失败返回None
+    """
+    print(f"=== 开始加载词表：{vocab_path} ===")
+    try:
+        # 1. 检查文件是否存在
+        if not os.path.exists(vocab_path):
+            print(f"错误：词表文件不存在 → {vocab_path}")
+            return None
+        print(f"词表文件存在：{vocab_path}")
+        
+        # 2. 检查文件大小（避免空文件）
+        file_size = os.path.getsize(vocab_path)
+        if file_size < 10:  # 小于10字节视为空文件
+            print(f"错误：词表文件为空 → 大小{file_size}字节")
+            return None
+        print(f"词表文件大小：{file_size}字节")
+        
+        # 3. 读取词表（强制UTF-8编码）
+        with open(vocab_path, 'r', encoding='utf-8') as f:
+            vocab_list = [line.strip() for line in f if line.strip()]
+        
+        # 4. 自动补充特殊标记
+        if require_special_tokens:
+            missing_tokens = [t for t in SPECIAL_TOKENS if t not in vocab_list]
+            if missing_tokens:
+                print(f"提示：词表缺少特殊标记，自动补充 → {missing_tokens}")
+                vocab_list = missing_tokens + vocab_list
+            print(f"补充特殊标记后，词表总条目数：{len(vocab_list)}")
+        else:
+            print(f"成功读取词表条目数：{len(vocab_list)}")
+        
+        # 5. 构建word2id并返回
+        word2id = {word: idx for idx, word in enumerate(vocab_list)}
+        print(f"词表加载完成，word2id长度：{len(word2id)}")
+        return word2id
+
+    except UnicodeDecodeError as e:
+        print(f"错误：词表编码不是UTF-8 → {e}")
+        return None
+    except Exception as e:
+        print(f"词表加载失败：{str(e)}")
+        return None
+
+def text_preprocess(text, word2id, max_len):
+    """
+    文本预处理：分词→转ID→Padding/截断（带鲁棒性处理）
+    :param text: 输入文本
+    :param word2id: 词表映射
+    :param max_len: 最大长度
+    :return: 处理后的张量，失败返回None
+    """
+    if not word2id:
+        print("错误：word2id为None，无法进行文本预处理")
+        return None
+    
+    # 1. 获取特殊标记ID（带兜底）
+    unk_id = word2id.get('_UNK', 3)
+    pad_id = word2id.get('_PAD', 2)
+    
+    # 2. 中文分词
+    words = lcut(text.strip())
+    if not words:
+        print("警告：输入文本分词后为空")
+        pad_tensor = tf.convert_to_tensor([[pad_id]*max_len], dtype=tf.int32)
+        return pad_tensor
+    
+    # 3. 转ID（未知词用_UNK）
+    ids = [word2id.get(word, unk_id) for word in words]
+    
+    # 4. 统一长度
+    if len(ids) < max_len:
+        ids += [pad_id] * (max_len - len(ids))
+    else:
+        ids = ids[:max_len]
+    
+    return tf.convert_to_tensor([ids], dtype=tf.int32)
+
+# ===================== 豆包API调用函数 =====================
+def call_doubao_api(user_input):
+    """
+    调用豆包API获取对话回复
+    :param user_input: 用户输入的聊天内容
+    :return: 豆包的回复内容（失败返回兜底提示）
+    """
+    # 替换为你的真实Token（从火山方舟获取）
+    YOUR_AUTH_TOKEN = "Bearer 072cc348-3918-48c3-8a22-3fb73a51288a"
+    MODEL_NAME = "doubao-seed-1-6-lite-251015"
+
+    try:
+        conn = http.client.HTTPSConnection("ark.cn-beijing.volces.com")
+        request_body = json.dumps({
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": "你是一个贴心的智能聊天助手，回答简洁明了，符合中文表达习惯"},
+                {"role": "user", "content": user_input}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1024
+        })
+        request_headers = {
+            'Authorization': YOUR_AUTH_TOKEN,
+            'Content-Type': 'application/json'
+        }
+        conn.request("POST", "/api/v3/chat/completions", request_body, request_headers)
+        response = conn.getresponse()
+        response_data = json.loads(response.read().decode("utf-8"))
+        conn.close()
+
+        print("豆包API响应内容：", response_data)
+        bot_reply = response_data["choices"][0]["message"]["content"]
+        return bot_reply
+
+    except KeyError as e:
+        print(f"豆包API响应解析失败：缺少字段{e}")
+        return "抱歉，我暂时无法理解你的意思~"
+    except Exception as e:
+        print(f"豆包API调用失败：{e}")
+        return "哎呀，网络有点小问题，稍后再试吧~"
+
+# ===================== 核心对话预测函数 =====================
+def chat(sentence='你好'):
+    dict_full_path = os.path.join(DATA_PATH, 'all_dict.txt')
+    try:
+        # 读取词典
+        with open(dict_full_path, 'r', encoding='utf-8') as f:
+            vocab_list = [line.strip() for line in f if line.strip()]
+        
+        # 构建哈希表
+        vocab_keys = tf.constant(vocab_list, dtype=tf.string)
+        vocab_values = tf.constant(range(len(vocab_list)), dtype=tf.int64)
+        table_initializer = tf.lookup.KeyValueTensorInitializer(vocab_keys, vocab_values)
+        table = tf.lookup.StaticHashTable(
+            initializer=table_initializer,
+            default_value=3  # _UNK的默认ID
+        )
+    except Exception as e:
+        print(f"哈希表构建失败：{e}")
+        return "词典加载异常，请检查词典文件路径和格式"
+
+    # 实例化编码器、解码器
+    vocab_size = len(vocab_list) + len(SPECIAL_TOKENS)
+    encoder = Encoder(vocab_size, EMBEDDING_DIM, HIDDEN_DIM)
+    decoder = Decoder(vocab_size, EMBEDDING_DIM, HIDDEN_DIM)
+    optimizer = tf.keras.optimizers.Adam()
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer, encoder=encoder, decoder=decoder)
+    
+    # 加载模型参数
+    try:
+        latest_ckpt = tf.train.latest_checkpoint(CHECKPOINT_PATH)
+        if not latest_ckpt:
+            return "未找到训练好的模型，请先训练模型"
+        checkpoint.restore(latest_ckpt).expect_partial()
+    except Exception as e:
+        print(f"模型加载失败：{e}")
+        return "模型加载异常，请检查模型路径是否正确"
+
+    # 构建词表映射
+    try:
+        with open(dict_full_path, 'r', encoding='utf-8') as f:
+            all_dict = [line.strip() for line in f if line.strip()]
+    except (FileNotFoundError, UnicodeDecodeError) as e:
+        print(f"词典文件异常：{e}")
+        return "词典文件缺失或编码错误，请检查"
+    
+    word2id = {j: i+len(SPECIAL_TOKENS) for i, j in enumerate(all_dict)}
+    for idx, token in enumerate(SPECIAL_TOKENS):
+        word2id[token] = idx
+    id2word = dict(zip(word2id.values(), word2id.keys()))
+    
+    # 分词预处理
+    for tag in SPECIAL_TOKENS:
+        add_word(tag)
+    
+    if not sentence.strip():
+        return "请输入有效内容"
+    
+    sentence = '_BOS' + sentence + '_EOS'
+    inputs = [word2id.get(token, word2id['_UNK']) for token in lcut(sentence)]
+    
+    # 长度填充
+    inputs = tf.keras.preprocessing.sequence.pad_sequences(
+        [inputs], 
+        maxlen=MAX_LENGTH, 
+        padding='post', 
+        truncating='post',
+        value=word2id['_PAD']
+    )
+    inputs = tf.convert_to_tensor(inputs)
+
+    # Seq2Seq预测
+    result = ''
+    enc_out, enc_hidden = encoder(inputs)
+    dec_hidden = enc_hidden
+    dec_input = tf.expand_dims([word2id['_BOS']], 0)
+
+    for t in range(MAX_LENGTH):
+        predictions, dec_hidden, attention_weights = decoder(dec_input, dec_hidden, enc_out)
+        predicted_id = tf.argmax(predictions[0]).numpy()
+        current_word = id2word.get(predicted_id, '_UNK')
+        if current_word == '_EOS':
+            break
+        result += current_word
+        dec_input = tf.expand_dims([predicted_id], 0)
+        
+    result = re.sub(r'(.)\1+', r'\1', result)
+
+    if not result.strip():
+        result = "我不太明白你的意思"
+    return result
+
+# ===================== 文本分类模型 =====================
+def text_classify(input_text):
+    input_text = input_text.strip()
+    if not input_text:
+        return "请输入有效的文本内容进行分类~"
+    
+    try:
+        # 全局变量初始化
+        global classify_word2id, text_classify_model
+        if 'classify_word2id' not in globals():
+            classify_word2id = None
+        if 'text_classify_model' not in globals():
+            text_classify_model = None
+
+        # 加载分类词表
+        if classify_word2id is None:
+            classify_word2id = load_vocab(TEXT_CLASSIFY_VOCAB_PATH)
+            if classify_word2id is None or len(classify_word2id) == 0:
+                print("本地词表加载失败，调用豆包API兜底分类")
+                doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+                return doubao_reply.strip()
+
+        # 加载分类模型
+        if text_classify_model is None:
+            if not os.path.exists(TEXT_CLASSIFY_MODEL_PATH):
+                print("本地分类模型不存在，调用豆包API兜底分类")
+                doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+                return doubao_reply.strip()
+            
+            try:
+                text_classify_model = tf.keras.models.load_model(TEXT_CLASSIFY_MODEL_PATH)
+                text_classify_model.compile(
+                    loss='categorical_crossentropy',
+                    optimizer='adam',
+                    metrics=['accuracy']
+                )
+            except Exception as model_e:
+                print(f"模型加载异常：{model_e}，调用豆包API兜底分类")
+                doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+                return doubao_reply.strip()
+
+        # 文本预处理
+        input_tensor = text_preprocess(input_text, classify_word2id, TEXT_CLASSIFY_MAX_LEN)
+        if input_tensor is None:
+            print("预处理失败，调用豆包API兜底分类")
+            doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+            return doubao_reply.strip()
+
+        # 分类预测
+        pred_probs = text_classify_model.predict(input_tensor, verbose=0)
+        pred_idx = tf.argmax(pred_probs, axis=1).numpy()[0]
+        
+        if pred_idx < 0 or pred_idx >= len(CLASSIFY_LABELS):
+            print(f"分类索引越界（pred_idx={pred_idx}），调用豆包API兜底")
+            doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+            return doubao_reply.strip()
+        
+        confidence = pred_probs[0][pred_idx]
+        classify_label = CLASSIFY_LABELS[pred_idx]
+        return f"文本分类结果：{classify_label}（置信度：{confidence:.2f}）"
+    
+    except Exception as e:
+        print(f"文本分类详细错误：{str(e)}")
+        doubao_reply = call_doubao_api(f"对文本「{input_text}」进行精准文本分类，返回格式：这是**XXX**类文本，核心内容说明：XXX")
+        return f"文本分类结果：{doubao_reply.strip()}"
+
+# ===================== 情感分析模型 =====================
+def sentiment_analysis(input_text):
+    input_text = input_text.strip()
+    if not input_text:
+        return "请输入有效的文本内容进行情感分析~"
+    
+    try:
+        # 全局变量初始化
+        global sentiment_word2id, sentiment_model
+        if 'sentiment_word2id' not in globals():
+            sentiment_word2id = None
+        if 'sentiment_model' not in globals():
+            sentiment_model = None
+
+        # 加载词表
+        if sentiment_word2id is None:
+            if os.path.exists(SENTIMENT_VOCAB_PATH):
+                sentiment_word2id = load_vocab(SENTIMENT_VOCAB_PATH)
+            else:
+                print(f"情感独立词表不存在，复用文本分类词表 → {TEXT_CLASSIFY_VOCAB_PATH}")
+                sentiment_word2id = load_vocab(TEXT_CLASSIFY_VOCAB_PATH)
+        
+        if sentiment_word2id is None:
+            print("本地词表加载失败，调用豆包API进行情感分析")
+            doubao_reply = call_doubao_api(f"分析这句话的情感：{input_text}，返回格式为「正面/负面/中性」情感（置信度：0.XX）")
+            return doubao_reply.strip()
+
+        # 加载情感模型
+        if sentiment_model is None:
+            if not os.path.exists(SENTIMENT_MODEL_PATH):
+                print("本地情感模型不存在，调用豆包API进行情感分析")
+                doubao_reply = call_doubao_api(f"分析这句话的情感：{input_text}，返回格式为「正面/负面/中性」情感（置信度：0.XX）")
+                return doubao_reply.strip()
+            
+            try:
+                sentiment_model = tf.keras.models.load_model(SENTIMENT_MODEL_PATH)
+                sentiment_model.compile(
+                    loss='binary_crossentropy',
+                    optimizer='adam',
+                    metrics=['accuracy']
+                )
+            except Exception as load_e:
+                print(f"模型加载失败：{load_e}，调用豆包API兜底")
+                doubao_reply = call_doubao_api(f"分析这句话的情感：{input_text}，返回格式为「正面/负面/中性」情感（置信度：0.XX）")
+                return doubao_reply.strip()
+
+        # 文本预处理
+        input_tensor = text_preprocess(input_text, sentiment_word2id, SENTIMENT_MAX_LEN)
+        if input_tensor is None:
+            print("预处理失败，调用豆包API兜底")
+            doubao_reply = call_doubao_api(f"分析这句话的情感：{input_text}，返回格式为「正面/负面/中性」情感（置信度：0.XX）")
+            return doubao_reply.strip()
+
+        # 情感预测
+        pred_prob = sentiment_model.predict(input_tensor, verbose=0)[0][0]
+        if pred_prob > 0.6:
+            sentiment = "正面"
+            confidence = pred_prob
+        elif pred_prob < 0.4:
+            sentiment = "负面"
+            confidence = 1 - pred_prob
+        else:
+            sentiment = "中性"
+            confidence = round(1 - abs(pred_prob - 0.5), 2)
+
+        return f"情感分析结果：{sentiment}情感（置信度：{confidence:.2f}）"
+    
+    except Exception as e:
+        print(f"情感分析详细错误：{str(e)}")
+        doubao_reply = call_doubao_api(f"分析这句话的情感：{input_text}，返回格式为「正面/负面/中性」情感（置信度：0.XX）")
+        return f"情感分析结果：{doubao_reply.strip()}"
+
+# ===================== 机器翻译模型（英→中） =====================
+import tensorflow as tf
+import re
+import logging
+import os
+import sys
+from functools import lru_cache
+
+# ===================== 1. 日志配置优化（避免重复配置） =====================
+def setup_logger():
+    """初始化日志配置（仅执行一次）"""
+    if not logging.getLogger("translation").handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout),  # 输出到控制台
+                logging.FileHandler('translation.log', encoding='utf-8')  # 输出到日志文件
+            ]
+        )
+    return logging.getLogger("translation")
+
+logger = setup_logger()
+
+# ===================== 2. 全局配置（跨平台适配+可配置） =====================
+# 常用翻译词典（大幅扩充）
+COMMON_TRANSLATIONS = {
+    # 基础问候
+    "i love you": "我爱你",
+    "love you": "爱你",
+    "i": "我",
+    "you": "你",
+    "hello": "你好",
+    "hello world": "你好世界",
+    "hi": "嗨",
+    "hi there": "嗨，你好",
+    "good morning": "早上好",
+    "good afternoon": "下午好",
+    "good evening": "晚上好",
+    "good night": "晚安",
+    # 感谢/道歉
+    "thank you": "谢谢你",
+    "thanks": "谢谢",
+    "thank you very much": "非常感谢",
+    "thanks a lot": "多谢",
+    "sorry": "对不起",
+    "i'm sorry": "我很抱歉",
+    "excuse me": "打扰一下",
+    # 日常交流
+    "goodbye": "再见",
+    "see you": "回头见",
+    "see you tomorrow": "明天见",
+    "how are you": "你好吗",
+    "i'm fine": "我很好",
+    "what's your name": "你叫什么名字",
+    "my name is tom": "我的名字是汤姆",
+    "where are you from": "你来自哪里",
+    "i'm from china": "我来自中国",
+    # 场景化表达
+    "have a nice day": "祝你今天愉快",
+    "happy new year": "新年快乐",
+    "merry christmas": "圣诞快乐",
+    "take care": "保重",
+    "no problem": "没问题",
+    "you're welcome": "不客气",
+    "nice to meet you": "很高兴认识你",
+    "how old are you": "你多大了",
+    "i want to eat": "我想吃东西",
+    "what time is it": "现在几点了",
+    "i like this book": "我喜欢这本书",
+    "this is a cat": "这是一只猫",
+    "i go to school": "我去上学"
+}
+
+# 特殊标记（与词表保持一致）
+SPECIAL_TOKENS = ['_BOS', '_EOS', '_PAD', '_UNK']
+# 模型超参数（可根据训练配置调整）
+EMBEDDING_DIM = 128
+HIDDEN_DIM = 256
+TRANSLATION_MAX_LEN = 30
+
+# ===================== 3. 路径适配（自动识别系统，避免硬编码） =====================
+# 获取项目根目录（跨平台兼容）
+if sys.platform.startswith('win32'):
+    # Windows路径（示例：E:\NLP_Project\AI_QuestionAnswering）
+    PROJECT_ROOT = r"E:\NLP_Project\AI_QuestionAnswering"
+else:
+    # Linux/Mac路径
+    PROJECT_ROOT = "/root/autodl-tmp/AI_QuestionAnswering"
+
+# 动态拼接路径（避免硬编码错误）
+EN_VOCAB_PATH = os.path.join(PROJECT_ROOT, "data", "en_vocab.txt")
+ZH_VOCAB_PATH = os.path.join(PROJECT_ROOT, "data", "zh_vocab.txt")
+TRANSLATION_CKPT_PATH = os.path.join(PROJECT_ROOT, "code", "tmp", "translation_model")
+
+# ===================== 4. 辅助函数（修复缓存+鲁棒性） =====================
+@lru_cache(maxsize=4)  # 扩大缓存，加入路径哈希作为key
+def load_trans_vocab(vocab_path):
+    """
+    加载翻译词表（修复重复插入特殊标记+编码容错+缓存优化）
+    :param vocab_path: 词表文件路径
+    :return: word2id字典 | None
+    """
+    try:
+        # 检查文件是否存在
+        if not os.path.exists(vocab_path):
+            logger.error(f"词表文件不存在：{vocab_path}")
+            return None
+        
+        # 读取词表（兼容gbk/utf-8编码）
+        vocab = []
+        encodings = ['utf-8', 'gbk', 'gb2312']
+        for encoding in encodings:
+            try:
+                with open(vocab_path, 'r', encoding=encoding) as f:
+                    vocab = [line.strip() for line in f if line.strip()]
+                break
+            except UnicodeDecodeError:
+                continue
+        if not vocab:
+            logger.error(f"词表文件为空或无法解码：{vocab_path}")
+            return None
+        
+        # 补充特殊标记（去重，避免重复插入）
+        for token in SPECIAL_TOKENS:
+            if token not in vocab:
+                vocab.insert(0, token)
+        # 去重（避免词表重复词汇）
+        vocab = list(dict.fromkeys(vocab))
+        
+        word2id = {w: i for i, w in enumerate(vocab)}
+        logger.info(f"成功加载词表：{vocab_path}，词表大小：{len(word2id)}")
+        return word2id
+    except Exception as e:
+        logger.error(f"加载词表失败：{str(e)}，路径：{vocab_path}")
+        return None
+
+@lru_cache(maxsize=4)  # 缓存key加入超参数，避免模型缓存错误
+def init_translation_model(en_vocab_size, zh_vocab_size, embedding_dim, hidden_dim):
+    """
+    初始化翻译模型（修复缓存key+鲁棒性）
+    :param en_vocab_size: 英文词表大小
+    :param zh_vocab_size: 中文词表大小
+    :param embedding_dim: 嵌入维度
+    :param hidden_dim: 隐藏层维度
+    :return: (encoder, decoder) | (None, None)
+    """
+    try:
+        # 校验参数合法性
+        if not all(isinstance(x, int) and x > 0 for x in [en_vocab_size, zh_vocab_size, embedding_dim, hidden_dim]):
+            logger.error("模型初始化参数非法（必须为正整数）")
+            return None, None
+        
+        # 初始化编码器/解码器
+        encoder = Encoder(en_vocab_size, embedding_dim, hidden_dim)
+        decoder = Decoder(zh_vocab_size, embedding_dim, hidden_dim)
+        
+        # 加载训练权重（兼容Windows路径）
+        ckpt = tf.train.Checkpoint(encoder=encoder, decoder=decoder)
+        latest_ckpt = tf.train.latest_checkpoint(TRANSLATION_CKPT_PATH)
+        
+        if latest_ckpt:
+            ckpt.restore(latest_ckpt).expect_partial()
+            logger.info(f"成功加载翻译模型权重：{latest_ckpt}")
+        else:
+            logger.warning(f"未找到翻译模型权重，路径：{TRANSLATION_CKPT_PATH}，将使用随机初始化模型")
+        
+        return encoder, decoder
+    except Exception as e:
+        logger.error(f"初始化翻译模型失败：{str(e)}")
+        return None, None
+
+def preprocess_input_text(input_text):
+    """
+    预处理输入文本（增强清洗逻辑）
+    :param input_text: 原始输入文本
+    :return: (清洗后的文本, 预处理状态)
+    """
+    # 空值/全空格处理
+    if not input_text or input_text.strip() == "":
+        return "", "empty_input"
+    
+    # 转为小写，去除首尾空格
+    clean_text = input_text.strip().lower()
+    
+    # 保留基本标点（. , ? !），去除其他特殊字符
+    clean_text = re.sub(r'[^\w\s.,?!]', ' ', clean_text)
+    # 合并多个空格为一个
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    # 去除首尾标点
+    clean_text = re.sub(r'^[.,?!\s]+|[.,?!\s]+$', '', clean_text)
+    
+    # 检测是否为中文输入（避免用户输反）
+    if re.search(r'[\u4e00-\u9fff]', clean_text):
+        return clean_text, "chinese_input"
+    
+    return clean_text, "success"
+
+def postprocess_translation(result):
+    """
+    后处理翻译结果（优化去重+标点规范化）
+    :param result: 原始翻译结果
+    :return: 优化后的结果
+    """
+    if not result:
+        return ""
+    
+    # 智能去重：仅去除连续3次以上的重复字符
+    result = re.sub(r'(.)\1{2,}', r'\1', result)
+    # 去除特殊标记
+    for token in SPECIAL_TOKENS:
+        result = result.replace(token, '')
+    # 规范中文标点
+    result = result.replace(' ,', '，').replace(' .', '。')
+    result = result.replace(' ?', '？').replace(' !', '！')
+    # 去除首尾空格和多余标点
+    result = re.sub(r'^[，。？！\s]+|[，。？！\s]+$', '', result)
+    return result
+
+# ===================== 5. 核心翻译函数（修复所有潜在错误） =====================
+def machine_translation(input_text):
+    """
+    优化版机器翻译函数：
+    - 跨平台路径兼容
+    - 增强异常处理
+    - 修复张量操作鲁棒性
+    - 优化模型缓存逻辑
+    """
+    try:
+        # 第一步：预处理输入文本
+        clean_text, pre_status = preprocess_input_text(input_text)
+        
+        # 边界场景处理
+        if pre_status == "empty_input":
+            return "⚠️ 翻译失败：请输入有效的英文文本（不能为空）"
+        if pre_status == "chinese_input":
+            return "⚠️ 翻译失败：当前仅支持「英文→中文」翻译，请输入英文文本"
+        
+        # 第二步：优先匹配常用词典（快速返回）
+        if clean_text in COMMON_TRANSLATIONS:
+            return f"✅ 英→中翻译结果：{COMMON_TRANSLATIONS[clean_text]}"
+        
+        # 第三步：加载词表
+        en_word2id = load_trans_vocab(EN_VOCAB_PATH)
+        zh_word2id = load_trans_vocab(ZH_VOCAB_PATH)
+        if not en_word2id or not zh_word2id:
+            return "❌ 翻译失败：词表加载失败，请检查词表文件路径或文件完整性"
+        
+        # 构建中文id2word映射
+        zh_id2word = {i: w for w, i in zh_word2id.items()}
+        
+        # 第四步：初始化模型（传入超参数，修复缓存）
+        en_vocab_size = len(en_word2id)
+        zh_vocab_size = len(zh_word2id)
+        encoder, decoder = init_translation_model(en_vocab_size, zh_vocab_size, EMBEDDING_DIM, HIDDEN_DIM)
+        if not encoder or not decoder:
+            return "❌ 翻译失败：模型初始化失败，请检查模型权重路径"
+        
+        # 第五步：构建输入ID序列（增强鲁棒性）
+        # 特殊标记ID（兜底取值，避免KeyError）
+        bos_id = en_word2id.get('_BOS', 0)
+        eos_id = en_word2id.get('_EOS', 1)
+        pad_id = en_word2id.get('_PAD', 2)
+        unk_id = en_word2id.get('_UNK', 3)
+        
+        # 拆分单词并转换为ID
+        input_words = clean_text.split() if clean_text else []
+        input_ids = [bos_id] + [en_word2id.get(w, unk_id) for w in input_words] + [eos_id]
+        
+        # 填充/截断到固定长度（校验长度合法性）
+        max_len = max(1, TRANSLATION_MAX_LEN)  # 确保至少为1
+        if len(input_ids) < max_len:
+            input_ids += [pad_id] * (max_len - len(input_ids))
+        elif len(input_ids) > max_len:
+            input_ids = input_ids[:max_len]
+            # 确保最后一位是EOS（截断后补全结束标记）
+            if input_ids[-1] != eos_id:
+                input_ids[-1] = eos_id
+        
+        # 校验input_ids合法性（避免张量转换错误）
+        input_ids = [int(i) for i in input_ids if isinstance(i, (int, float)) and i >= 0]
+        if not input_ids:
+            input_ids = [bos_id, pad_id, eos_id] + [pad_id] * (max_len - 3)
+        
+        # 转换为张量（指定设备，避免GPU/CPU冲突）
+        with tf.device('/CPU:0'):  # 强制CPU运行，避免GPU适配问题
+            input_tensor = tf.convert_to_tensor([input_ids], dtype=tf.int32)
+        logger.info(f"翻译输入张量shape：{input_tensor.shape}，输入ID序列：{input_ids[:10]}...")
+        
+        # 第六步：执行翻译推理
+        translation_result = ""
+        enc_output, enc_hidden = encoder(input_tensor)
+        dec_hidden = enc_hidden
+        dec_input = tf.expand_dims([zh_word2id.get('_BOS', 0)], 0)
+        dec_eos_id = zh_word2id.get('_EOS', 1)
+        dec_unk_id = zh_word2id.get('_UNK', 3)
+        
+        for _ in range(max_len):
+            predictions, dec_hidden, _ = decoder(dec_input, dec_hidden, enc_output)
+            pred_id = tf.argmax(predictions[0]).numpy()
+            
+            # 遇到结束标记停止推理
+            if pred_id == dec_eos_id:
+                break
+            
+            # 获取当前字符（过滤所有特殊标记）
+            current_char = zh_id2word.get(pred_id, "")
+            is_special = pred_id in [bos_id, eos_id, pad_id, unk_id, dec_unk_id]
+            
+            if not is_special and current_char:
+                translation_result += current_char
+            
+            # 更新解码器输入
+            dec_input = tf.expand_dims([pred_id], 0)
+        
+        # 第七步：后处理翻译结果
+        final_result = postprocess_translation(translation_result)
+        
+        # 结果兜底
+        if not final_result:
+            return "⚠️ 翻译完成，但未生成有效结果（可能原因：模型未训练/权重加载失败/输入文本无匹配词汇）"
+        
+        return f"✅ 英→中翻译结果：{final_result}"
+
+    except Exception as e:
+        error_detail = str(e)[:100]
+        logger.error(f"翻译异常：{str(e)}")
+        return f"❌ 翻译异常：{error_detail}（请检查词表/模型路径或输入格式）"
+
+# ===================== 6. 编码器/解码器（修复冗余参数+鲁棒性） =====================
+class Encoder(tf.keras.Model):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        self.gru = tf.keras.layers.GRU(hidden_dim, return_sequences=True, return_state=True)
+    
+    def call(self, x, hidden=None):
+        """
+        编码器前向传播
+        :param x: 输入张量 (batch_size, seq_len)
+        :param hidden: 初始隐藏状态 (batch_size, hidden_dim)
+        :return: (输出序列, 最终隐藏状态)
+        """
+        # 嵌入层转换
+        x = self.embedding(x)
+        # 初始化隐藏状态（避免None报错）
+        if hidden is None:
+            hidden = tf.zeros((x.shape[0], self.hidden_dim))
+        # GRU前向传播
+        output, state = self.gru(x, initial_state=hidden)
+        return output, state
+
+class Decoder(tf.keras.Model):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        self.gru = tf.keras.layers.GRU(hidden_dim, return_sequences=True, return_state=True)
+        self.fc = tf.keras.layers.Dense(vocab_size)
+    
+    def call(self, x, hidden, enc_output):
+        """
+        解码器前向传播（移除冗余参数enc_output的警告，注释说明扩展方向）
+        :param x: 输入张量 (batch_size, 1)
+        :param hidden: 编码器最终隐藏状态 (batch_size, hidden_dim)
+        :param enc_output: 编码器输出序列（预留注意力机制使用）
+        :return: (预测概率, 解码器隐藏状态, None)
+        """
+        # 嵌入层转换
+        x = self.embedding(x)
+        # GRU前向传播
+        output, state = self.gru(x, initial_state=hidden)
+        # 展平输出（适配全连接层）
+        output = tf.reshape(output, (-1, output.shape[2]))
+        # 全连接层预测
+        x = self.fc(output)
+        return x, state, None
+
+# ===================== 7. 测试代码（验证功能正确性） =====================
+if __name__ == "__main__":
+    # 测试用例
+    test_cases = [
+        "hello",
+        "i love you",
+        "what time is it",
+        "",  # 空输入
+        "你好",  # 中文输入
+        "i like this book"
+    ]
+    
+    print("=== 翻译功能测试 ===")
+    for case in test_cases:
+        result = machine_translation(case)
+        print(f"输入：{case}")
+        print(f"输出：{result}\n")
+
+
+
+
+
+
+
+
+
+
+
+# ===================== Flask Web服务配置 =====================
+app = Flask(
+    __name__,
+    static_url_path='/static',
+    static_folder='static',
+    template_folder='templates'
+)
+
+# ===================== 接口定义 =====================
+@app.route('/message', methods=['POST'])
+def handle_message():
+    try:
+        if 'msg' not in request.form:
+            return jsonify({'text': '请传入msg参数~'})
+        user_msg = request.form['msg'].strip()
+
+        # 指令1：文本分类
+        if user_msg.startswith("分类："):
+            input_text = user_msg[3:].strip()
+            if not input_text:
+                return jsonify({'text': '请在“分类：”后输入内容~'})
+            result = text_classify(input_text)
+        # 指令2：情感分析
+        elif user_msg.startswith("情感："):
+            input_text = user_msg[3:].strip()
+            if not input_text:
+                return jsonify({'text': '请在“情感：”后输入内容~'})
+            result = sentiment_analysis(input_text)
+        # 指令3：机器翻译
+        elif user_msg.startswith("翻译："):
+            input_text = user_msg[3:].strip()
+            if not input_text:
+                return jsonify({'text': '请在“翻译：”后输入英文内容~'})
+            result = machine_translation(input_text)
+        # 无指令：默认调用豆包API
+        else:
+            result = call_doubao_api(user_msg)
+
+        # 兜底处理
+        result_friendly = result.replace('_UNK', '^_^').replace('<UNK>', '^_^')
+        if not result_friendly.strip():
+            result_friendly = '我们来聊点什么吧~'
+        return jsonify({'text': result_friendly.strip()})
+    except Exception as e:
+        print(f"消息处理异常：{e}")
+        return jsonify({'text': '服务端出了点小问题，稍后再试吧~'})
+
+@app.route('/')
+def show_chat_page():
+    """展示聊天前端页面"""
+    try:
+        return render_template('index.html')
+    except Exception as e:
+        print(f"页面加载失败：{e}")
+        return "聊天页面缺失，请检查templates目录下是否存在index.html文件"
+
+# ===================== 启动服务 =====================
+if __name__ == '__main__':
+    print("="*50)
+    print("聊天机器人服务启动中...")
+    print(f"系统类型：{SYSTEM_TYPE}")
+    print(f"数据路径：{DATA_PATH}")
+    print(f"访问地址：http://localhost:8808")
+    print("="*50)
+    app.run(
+        host='0.0.0.0',
+        port=8808,
+        debug=True  # 开发环境开启，生产环境关闭
+    )
